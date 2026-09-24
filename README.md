@@ -30,6 +30,43 @@ cd safe_minimal
 
 After a successful flash, force-close Wallet on the iPhone and reopen it.
 
+## Find UDID and CARD_ID
+
+This tool does not auto-detect devices or cards. Prepare both values before
+running `flash.py`.
+
+### UDID
+
+1. Connect the iPhone over USB and unlock it.
+2. Open **Finder** and select the iPhone in the sidebar.
+3. Click the text under the device name to toggle **Serial Number** and
+   **UDID**.
+4. Copy the UDID.
+
+### CARD_ID
+
+`CARD_ID` is the Wallet card identifier (a Base64-like string such as
+`M6nDwZrkYbFlsodLgCbvyFZQ1cc=`).
+
+Use the read-only scanner:
+
+```sh
+cd safe_minimal
+./scan.py "<UDID>"
+```
+
+Then on the iPhone:
+
+1. Double-click the side button to open Wallet.
+2. Authenticate with Face ID.
+3. Tap the card you want to detect.
+
+Copy the value shown as `Detected card [1]: ...`, then press Enter to stop the
+scan.
+
+For more detail, see section 3–4 of
+[`docs/safe-minimal-runbook.md`](docs/safe-minimal-runbook.md).
+
 ## Communication
 
 The program invokes only:
