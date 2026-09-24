@@ -4,35 +4,29 @@
 
 typedef void *ATHostConnectionRef;
 
-extern ATHostConnectionRef ATHostConnectionCreate(CFStringRef deviceIdentifier);
+extern ATHostConnectionRef ATHostConnectionCreate(CFStringRef identifier);
 extern void ATHostConnectionRelease(ATHostConnectionRef connection);
 extern void ATHostConnectionSendHostInfo(ATHostConnectionRef connection,
-                                         CFDictionaryRef hostInfo);
+                                         CFDictionaryRef info);
 extern void ATHostConnectionSendSyncRequest(ATHostConnectionRef connection,
-                                            CFArrayRef dataclasses,
+                                            CFArrayRef classes,
                                             CFDictionaryRef anchors,
-                                            CFDictionaryRef hostInfo);
+                                            CFDictionaryRef info);
 extern void ATHostConnectionSendMetadataSyncFinished(
     ATHostConnectionRef connection,
-    CFDictionaryRef syncTypes,
+    CFDictionaryRef classes,
     CFDictionaryRef anchors);
 extern void ATHostConnectionSendAssetCompleted(ATHostConnectionRef connection,
-                                               CFStringRef assetIdentifier,
-                                               CFStringRef dataclass,
-                                               CFStringRef assetPath);
-extern CFDictionaryRef ATHostConnectionReadMessage(ATHostConnectionRef connection);
+                                               CFStringRef identifier,
+                                               CFStringRef dataClass,
+                                               CFStringRef destination);
+extern CFDictionaryRef ATHostConnectionReadMessage(
+    ATHostConnectionRef connection);
 extern CFStringRef ATCFMessageGetName(CFDictionaryRef message);
 extern CFTypeRef ATCFMessageGetParam(CFDictionaryRef message, CFStringRef key);
 
-static void TimeoutHandler(int signalNumber) {
-    (void)signalNumber;
-    const char message[] = "{\"ok\":false,\"error\":\"timeout\"}\n";
-    (void)write(STDOUT_FILENO, message, sizeof(message) - 1);
-    _exit(124);
-}
-
-static void PrintJSON(NSDictionary *object) {
-    NSData *data = [NSJSONSerialization dataWithJSONObject:object
+static void PrintJSON(NSDictionary *value) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:value
                                                    options:0
                                                      error:nil];
     if (!data) return;
@@ -40,12 +34,20 @@ static void PrintJSON(NSDictionary *object) {
     (void)write(STDOUT_FILENO, "\n", 1);
 }
 
-static NSDictionary *HostInfo(void) {
+static void TimedOut(int signalNumber) {
+    (void)signalNumber;
+    const char output[] = "{\"ok\":false,\"error\":\"timeout\"}\n";
+    (void)write(STDOUT_FILENO, output, sizeof(output) - 1);
+    _exit(124);
+}
+
+static NSDictionary *LocalHostInfo(void) {
     return @{
         @"Type": @"iTunes",
         @"Version": @"13.7.0.161",
-        @"MacOSVersion": NSProcessInfo.processInfo.operatingSystemVersionString,
-        @"SyncHostName": @"airlift",
+        @"MacOSVersion":
+            NSProcessInfo.processInfo.operatingSystemVersionString,
+        @"SyncHostName": @"safe-local-wallet",
         @"LibraryID": NSUUID.UUID.UUIDString,
         @"SyncedDataclasses": @[ @"Book" ],
         @"SyncedAssetTypes": @[ @"Book" ],
@@ -53,13 +55,15 @@ static NSDictionary *HostInfo(void) {
     };
 }
 
-static BOOL ManifestContains(NSDictionary *manifest, NSString *identifier) {
-    NSArray *books = [manifest[@"Book"] isKindOfClass:NSArray.class]
+static BOOL ManifestAllows(NSDictionary *manifest, NSString *identifier) {
+    NSArray *entries = [manifest[@"Book"] isKindOfClass:NSArray.class]
         ? manifest[@"Book"] : nil;
-    for (id entry in books) {
+    for (id entry in entries) {
         if ([entry isKindOfClass:NSDictionary.class] &&
             [entry[@"AssetID"] isEqual:identifier] &&
-            [entry[@"IsDownload"] boolValue]) return YES;
+            [entry[@"IsDownload"] boolValue]) {
+            return YES;
+        }
     }
     return NO;
 }
@@ -67,65 +71,60 @@ static BOOL ManifestContains(NSDictionary *manifest, NSString *identifier) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc < 6 || argc % 2 != 0) {
-            PrintJSON(@{ @"ok": @NO,
-                         @"error": @"usage: airtraffic_host udid id path [id path ...]" });
+            PrintJSON(@{ @"ok": @NO, @"error": @"invalid arguments" });
             return 64;
         }
-
         NSUInteger pairCount = (NSUInteger)(argc - 2) / 2;
-        if (pairCount > 2048) {
+        if (pairCount > 64) {
             PrintJSON(@{ @"ok": @NO, @"error": @"too many assets" });
             return 64;
         }
 
-        NSString *deviceIdentifier = [NSString stringWithUTF8String:argv[1]];
+        NSString *udid = [NSString stringWithUTF8String:argv[1]];
+        if (!udid.length) return 64;
         NSMutableArray<NSDictionary *> *assets = NSMutableArray.array;
         for (int index = 2; index < argc; index += 2) {
-            NSString *identifier = [NSString stringWithUTF8String:argv[index]];
+            NSString *identifier =
+                [NSString stringWithUTF8String:argv[index]];
             NSString *destination =
                 [NSString stringWithUTF8String:argv[index + 1]];
-            if (!identifier.length || !destination.length) {
-                PrintJSON(@{ @"ok": @NO, @"error": @"empty argument" });
-                return 64;
-            }
-            [assets addObject:@{ @"identifier": identifier,
-                                 @"destination": destination }];
-        }
-        if (!deviceIdentifier.length) {
-            PrintJSON(@{ @"ok": @NO, @"error": @"empty device identifier" });
-            return 64;
+            if (!identifier.length || !destination.length) return 64;
+            [assets addObject:@{
+                @"identifier": identifier,
+                @"destination": destination,
+            }];
         }
 
         signal(SIGPIPE, SIG_IGN);
-        signal(SIGALRM, TimeoutHandler);
-        alarm(300);
+        signal(SIGALRM, TimedOut);
+        alarm(180);
+
         ATHostConnectionRef connection =
-            ATHostConnectionCreate((__bridge CFStringRef)deviceIdentifier);
+            ATHostConnectionCreate((__bridge CFStringRef)udid);
         if (!connection) {
             PrintJSON(@{ @"ok": @NO,
-                         @"error": @"AirTraffic connection failed" });
+                         @"error": @"device connection failed" });
             return 2;
         }
 
-        BOOL syncAllowed = NO;
-        for (NSUInteger index = 0; index < 8 && !syncAllowed; index++) {
+        BOOL allowed = NO;
+        for (NSUInteger attempt = 0; attempt < 8 && !allowed; attempt++) {
             CFDictionaryRef raw = ATHostConnectionReadMessage(connection);
             if (!raw) {
                 usleep(100000);
                 continue;
             }
             NSString *name = (__bridge NSString *)ATCFMessageGetName(raw);
-            syncAllowed = [name isEqual:@"SyncAllowed"];
+            allowed = [name isEqual:@"SyncAllowed"];
             CFRelease(raw);
         }
-        if (!syncAllowed) {
+        if (!allowed) {
             ATHostConnectionRelease(connection);
-            PrintJSON(@{ @"ok": @NO,
-                         @"error": @"SyncAllowed not observed" });
+            PrintJSON(@{ @"ok": @NO, @"error": @"sync not allowed" });
             return 3;
         }
 
-        NSDictionary *hostInfo = HostInfo();
+        NSDictionary *hostInfo = LocalHostInfo();
         ATHostConnectionSendHostInfo(
             connection, (__bridge CFDictionaryRef)hostInfo);
         usleep(200000);
@@ -136,7 +135,7 @@ int main(int argc, const char *argv[]) {
             (__bridge CFDictionaryRef)hostInfo);
 
         BOOL ready = NO;
-        for (NSUInteger index = 0; index < 12 && !ready; index++) {
+        for (NSUInteger attempt = 0; attempt < 12 && !ready; attempt++) {
             CFDictionaryRef raw = ATHostConnectionReadMessage(connection);
             if (!raw) {
                 usleep(100000);
@@ -148,8 +147,7 @@ int main(int argc, const char *argv[]) {
         }
         if (!ready) {
             ATHostConnectionRelease(connection);
-            PrintJSON(@{ @"ok": @NO,
-                         @"error": @"ReadyForSync not observed" });
+            PrintJSON(@{ @"ok": @NO, @"error": @"device not ready" });
             return 4;
         }
 
@@ -159,7 +157,7 @@ int main(int argc, const char *argv[]) {
             (__bridge CFDictionaryRef)@{});
 
         NSDictionary *manifest = nil;
-        for (NSUInteger index = 0; index < 20 && !manifest; index++) {
+        for (NSUInteger attempt = 0; attempt < 20 && !manifest; attempt++) {
             CFDictionaryRef raw = ATHostConnectionReadMessage(connection);
             if (!raw) {
                 usleep(100000);
@@ -179,48 +177,27 @@ int main(int argc, const char *argv[]) {
             CFRelease(raw);
         }
 
-        NSUInteger missing = 0;
-        for (NSDictionary *asset in assets)
-            if (!ManifestContains(manifest, asset[@"identifier"])) missing++;
-        if (missing) {
-            ATHostConnectionRelease(connection);
-            PrintJSON(@{ @"ok": @NO,
-                         @"error": @"expected assets absent from manifest",
-                         @"missingCount": @(missing) });
-            return 5;
+        for (NSDictionary *asset in assets) {
+            if (!ManifestAllows(manifest, asset[@"identifier"])) {
+                ATHostConnectionRelease(connection);
+                PrintJSON(@{ @"ok": @NO,
+                             @"error": @"asset missing from manifest" });
+                return 5;
+            }
         }
 
-        for (NSUInteger index = 0; index < assets.count; index++) {
-            NSDictionary *asset = assets[index];
+        for (NSDictionary *asset in assets) {
             ATHostConnectionSendAssetCompleted(
                 connection,
                 (__bridge CFStringRef)asset[@"identifier"],
                 CFSTR("Book"),
                 (__bridge CFStringRef)asset[@"destination"]);
-            if (index > 0) {
-                NSString *leaf = [asset[@"destination"] lastPathComponent];
-                PrintJSON(@{
-                    @"type": @"atc_progress",
-                    @"index": @(index),
-                    @"total": @(assets.count - 1),
-                    @"leaf": leaf ?: @"",
-                });
-            }
-            if (index + 1 < assets.count) {
-                if (index == 0) {
-                    usleep(400000);
-                } else {
-                    usleep(60000);
-                }
-            }
+            usleep(60000);
         }
         sleep(2);
         ATHostConnectionRelease(connection);
         alarm(0);
-        PrintJSON(@{ @"ok": @YES,
-                     @"syncAllowed": @YES,
-                     @"readyForSync": @YES,
-                     @"fileCompleteMessages": @(assets.count) });
+        PrintJSON(@{ @"ok": @YES, @"assetCount": @(assets.count) });
         return 0;
     }
 }
